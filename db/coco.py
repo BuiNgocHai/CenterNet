@@ -26,15 +26,13 @@ class MSCOCO(DETECTION):
             "testdev": "testdev2017"
         }[self._split]
         
-        self._coco_dir = os.path.join(data_dir, "coco")
+        self._coco_dir = os.path.join(data_dir)
 
         self._label_dir  = os.path.join(self._coco_dir, "annotations")
         self._label_file = os.path.join(self._label_dir, "instances_{}.json")
         self._label_file = self._label_file.format(self._dataset)
-
-        self._image_dir  = os.path.join(self._coco_dir, "images", self._dataset)
+        self._image_dir  = os.path.join(self._coco_dir, "images")
         self._image_file = os.path.join(self._image_dir, "{}")
-
         self._data = "coco"
         self._mean = np.array([0.40789654, 0.44719302, 0.47026115], dtype=np.float32)
         self._std  = np.array([0.28863828, 0.27408164, 0.27809835], dtype=np.float32)
@@ -46,18 +44,12 @@ class MSCOCO(DETECTION):
         ], dtype=np.float32)
 
         self._cat_ids = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 
-            14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 
-            24, 25, 27, 28, 31, 32, 33, 34, 35, 36, 
-            37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 
-            48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 
-            58, 59, 60, 61, 62, 63, 64, 65, 67, 70, 
-            72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 
-            82, 84, 85, 86, 87, 88, 89, 90
+            1, 2
         ]
         self._classes = {
             ind + 1: cat_id for ind, cat_id in enumerate(self._cat_ids)
         }
+       
         self._coco_to_class_map = {
             value: key for key, value in self._classes.items()
         }
@@ -66,18 +58,21 @@ class MSCOCO(DETECTION):
         self._load_data()
         self._db_inds = np.arange(len(self._image_ids))
 
-        self._load_coco_data() 
+        #self._load_coco_data() 
 
     def _load_data(self):
         print("loading from cache file: {}".format(self._cache_file))
+        print(self._image_dir)
         if not os.path.exists(self._cache_file):
             print("No cache file found...")
-            self._extract_data()
+            self._extract_data_text()
             with open(self._cache_file, "wb") as f:
                 pickle.dump([self._detections, self._image_ids], f)
         else:
             with open(self._cache_file, "rb") as f:
                 self._detections, self._image_ids = pickle.load(f)
+            # print(self._detections['COCO_train2014_000000432817.jpg'])
+            # print(self._image_ids)
 
     def _load_coco_data(self):
         self._coco = COCO(self._label_file)
@@ -98,7 +93,54 @@ class MSCOCO(DETECTION):
         cat    = self._coco.loadCats([cat_id])[0]
         return cat["name"]
 
+    def _extract_data_text(self):
+        
+        label_dir = self._image_dir[:-6] + 'labels'
+
+        print('Start extract data')
+
+        self._image_ids = []
+        for img_id in os.listdir(self._image_dir):
+            if os.path.exists(os.path.join(label_dir, os.path.splitext(os.path.basename(img_id))[0]+'.json')):
+                self._image_ids.append(img_id)
+
+        self._detections = {}
+
+        for img_id in self._image_ids:
+            label_path = os.path.join(label_dir, os.path.splitext(os.path.basename(img_id))[0]+'.json')
+            data = json.load(open(label_path, 'r', encoding='utf-8'))
+            regions = data['attributes']['_via_img_metadata']['regions']
+
+            bboxes     = []
+            categories = []
+
+            for rg in regions:
+                region_attr = rg['region_attributes']
+                shape_attr = rg['shape_attributes']
+
+                try:
+                    if shape_attr['name'] == 'polygon':
+                            x1, y1, x2, y2 = min(shape_attr['all_points_x']), min(shape_attr['all_points_y']), max(
+                                shape_attr['all_points_x']), max(shape_attr['all_points_y'])
+                            x, y, w, h = x1, y1, x2 - x1, y2 - y1     
+                    else:
+                        x, y, w, h = shape_attr['x'], shape_attr['y'], shape_attr['width'], shape_attr['height']
+                    bbox = [x, y, x+w, y+h]
+                    bboxes.append(bbox)
+                    if('stamp' in region_attr['formal_key']):
+                        categories.append(2)
+                    else:
+                        categories.append(1)
+                except KeyError as e:
+                    print(e)
+                    continue
+            bboxes     = np.array(bboxes, dtype=float)
+            categories = np.array(categories, dtype=float)
+            
+            self._detections[img_id] = np.hstack((bboxes, categories[:, None]))
+
     def _extract_data(self):
+        print('Start extract data')
         self._coco    = COCO(self._label_file)
         self._cat_ids = self._coco.getCatIds()
 
@@ -116,17 +158,21 @@ class MSCOCO(DETECTION):
 
             for cat_id in self._cat_ids:
                 annotation_ids = self._coco.getAnnIds(imgIds=image["id"], catIds=cat_id)
+                
                 annotations    = self._coco.loadAnns(annotation_ids)
+                #print(annotations)
                 category       = self._coco_to_class_map[cat_id]
                 for annotation in annotations:
                     bbox = np.array(annotation["bbox"])
                     bbox[[2, 3]] += bbox[[0, 1]]
                     bboxes.append(bbox)
-
+                    
                     categories.append(category)
 
             bboxes     = np.array(bboxes, dtype=float)
             categories = np.array(categories, dtype=float)
+            print(bboxes)
+            print(categories)
             if bboxes.size == 0 or categories.size == 0:
                 self._detections[image_id] = np.zeros((0, 5), dtype=np.float32)
             else:
