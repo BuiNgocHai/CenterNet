@@ -179,6 +179,8 @@ def train(training_dbs, validation_db, start_iter=0):
                 nnet.train_mode()
 
             if iteration % snapshot == 0:
+                logger.info("saving model to {}".format(system_configs.snapshot_file.format(iteration)))
+                logger.info('-------------------------------------------------------------------')
                 nnet.save_params(iteration)
 
             if iteration % stepsize == 0:
