@@ -19,6 +19,21 @@ from nnet.py_factory import NetworkFactory
 from torch.multiprocessing import Process, Queue, Pool
 from db.datasets import datasets
 
+import os 
+import logging
+import time
+from datetime import datetime
+
+ 
+log_path = os.path.join('./log/', datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+os.makedirs(log_path, exist_ok=True)
+
+logging.basicConfig(filename=os.path.join(log_path, 'logs.log'), 
+                    format='%(asctime)s %(message)s', 
+                    filemode='w') 
+logger=logging.getLogger() 
+logger.setLevel(logging.DEBUG) 
+
 torch.backends.cudnn.enabled   = True
 torch.backends.cudnn.benchmark = True
 
@@ -133,7 +148,7 @@ def train(training_dbs, validation_db, start_iter=0):
     nnet.cuda()
     nnet.train_mode()
     with stdout_to_tqdm() as save_stdout:
-        for iteration in tqdm(range(start_iter + 1, max_iteration + 1), file=save_stdout, ncols=80):
+        for iteration in tqdm(range(start_iter + 1, max_iteration + 1), file=save_stdout, ncols=2):
             training = pinned_training_queue.get(block=True)
             training_loss, focal_loss, pull_loss, push_loss, regr_loss = nnet.train(**training)
             #training_loss, focal_loss, pull_loss, push_loss, regr_loss, cls_loss = nnet.train(**training)
@@ -144,6 +159,12 @@ def train(training_dbs, validation_db, start_iter=0):
                 print("pull loss at iteration {}:     {}".format(iteration, pull_loss.item())) 
                 print("push loss at iteration {}:     {}".format(iteration, push_loss.item()))
                 print("regr loss at iteration {}:     {}".format(iteration, regr_loss.item()))
+                logger.info("training loss at iteration {}: {}".format(iteration, training_loss.item()))
+                logger.info("focal loss at iteration {}:    {}".format(iteration, focal_loss.item()))
+                logger.info("pull loss at iteration {}:     {}".format(iteration, pull_loss.item())) 
+                logger.info("push loss at iteration {}:     {}".format(iteration, push_loss.item()))
+                logger.info("regr loss at iteration {}:     {}".format(iteration, regr_loss.item()))
+                logger.info('-------------------------------------------------------------------')
                 #print("cls loss at iteration {}:      {}\n".format(iteration, cls_loss.item()))
 
             del training_loss, focal_loss, pull_loss, push_loss, regr_loss#, cls_loss
@@ -153,6 +174,8 @@ def train(training_dbs, validation_db, start_iter=0):
                 validation = pinned_validation_queue.get(block=True)
                 validation_loss = nnet.validate(**validation)
                 print("validation loss at iteration {}: {}".format(iteration, validation_loss.item()))
+                logger.info("validation loss at iteration {}: {}".format(iteration, validation_loss.item()))
+                logger.info('-------------------------------------------------------------------')
                 nnet.train_mode()
 
             if iteration % snapshot == 0:

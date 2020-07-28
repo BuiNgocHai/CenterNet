@@ -1,232 +1,224 @@
-import sys
-sys.path.insert(0, "data/coco/PythonAPI/")
-
+#!/usr/bin/env python
 import os
+
 import json
+import torch
 import numpy as np
-import pickle
+import queue
+import pprint
+import random
+import argparse
+import importlib
+import threading
+import traceback
 
 from tqdm import tqdm
-from db.detection import DETECTION
+from utils import stdout_to_tqdm
 from config import system_configs
-from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
+from nnet.py_factory import NetworkFactory
+from torch.multiprocessing import Process, Queue, Pool
+from db.datasets import datasets
 
-class MSCOCO(DETECTION):
-    def __init__(self, db_config, split):
-        super(MSCOCO, self).__init__(db_config)
-        data_dir   = system_configs.data_dir
-        result_dir = system_configs.result_dir
-        cache_dir  = system_configs.cache_dir
+import os 
+import logging
+import time
+from datetime import datetime
 
-        self._split = split
-        self._dataset = {
-            "trainval": "trainval2014",
-            "minival": "minival2014",
-            "testdev": "testdev2017"
-        }[self._split]
-        
-        self._coco_dir = os.path.join(data_dir)
+ 
+log_path = os.path.join('./log/', datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+os.makedirs(log_path, exist_ok=True)
 
-        self._label_dir  = os.path.join(self._coco_dir, "annotations")
-        self._label_file = os.path.join(self._label_dir, "instances_{}.json")
-        self._label_file = self._label_file.format(self._dataset)
-        self._image_dir  = os.path.join(self._coco_dir, "images")
-        self._image_file = os.path.join(self._image_dir, "{}")
-        self._data = "coco"
-        self._mean = np.array([0.40789654, 0.44719302, 0.47026115], dtype=np.float32)
-        self._std  = np.array([0.28863828, 0.27408164, 0.27809835], dtype=np.float32)
-        self._eig_val = np.array([0.2141788, 0.01817699, 0.00341571], dtype=np.float32)
-        self._eig_vec = np.array([
-            [-0.58752847, -0.69563484, 0.41340352],
-            [-0.5832747, 0.00994535, -0.81221408],
-            [-0.56089297, 0.71832671, 0.41158938]
-        ], dtype=np.float32)
+logging.basicConfig(filename=os.path.join(log_path, 'logs.log'), 
+                    format='%(asctime)s %(message)s', 
+                    filemode='w') 
+logger=logging.getLogger() 
+logger.setLevel(logging.DEBUG) 
 
-        self._cat_ids = [
-            1, 2
-        ]
-        self._classes = {
-            ind + 1: cat_id for ind, cat_id in enumerate(self._cat_ids)
-        }
-       
-        self._coco_to_class_map = {
-            value: key for key, value in self._classes.items()
-        }
+torch.backends.cudnn.enabled   = True
+torch.backends.cudnn.benchmark = True
 
-        self._cache_file = os.path.join(cache_dir, "coco_{}.pkl".format(self._dataset))
-        self._load_data()
-        self._db_inds = np.arange(len(self._image_ids))
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train CenterNet")
+    parser.add_argument("cfg_file", help="config file", type=str)
+    parser.add_argument("--iter", dest="start_iter",
+                        help="train at iteration i",
+                        default=0, type=int)
+    parser.add_argument("--threads", dest="threads", default=4, type=int)
 
-        #self._load_coco_data() 
+    #args = parser.parse_args()
+    args, unparsed = parser.parse_known_args()
+    return args
 
-    def _load_data(self):
-        print("loading from cache file: {}".format(self._cache_file))
-        print(self._image_dir)
-        if not os.path.exists(self._cache_file):
-            print("No cache file found...")
-            self._extract_data_text()
-            with open(self._cache_file, "wb") as f:
-                pickle.dump([self._detections, self._image_ids], f)
-        else:
-            with open(self._cache_file, "rb") as f:
-                self._detections, self._image_ids = pickle.load(f)
-            # print(self._detections['COCO_train2014_000000432817.jpg'])
-            # print(self._image_ids)
+def prefetch_data(db, queue, sample_data, data_aug):
+    ind = 0
+    print("start prefetching data...")
+    np.random.seed(os.getpid())
+    while True:
+        try:
+            data, ind = sample_data(db, ind, data_aug=data_aug)
+            queue.put(data)
+        except Exception as e:
+            traceback.print_exc()
+            raise e
 
-    def _load_coco_data(self):
-        self._coco = COCO(self._label_file)
-        with open(self._label_file, "r") as f:
-            data = json.load(f)
+def pin_memory(data_queue, pinned_data_queue, sema):
+    while True:
+        data = data_queue.get()
 
-        coco_ids = self._coco.getImgIds()
-        eval_ids = {
-            self._coco.loadImgs(coco_id)[0]["file_name"]: coco_id
-            for coco_id in coco_ids
-        }
+        data["xs"] = [x.pin_memory() for x in data["xs"]]
+        data["ys"] = [y.pin_memory() for y in data["ys"]]
 
-        self._coco_categories = data["categories"]
-        self._coco_eval_ids   = eval_ids
+        pinned_data_queue.put(data)
 
-    def class_name(self, cid):
-        cat_id = self._classes[cid]
-        cat    = self._coco.loadCats([cat_id])[0]
-        return cat["name"]
+        if sema.acquire(blocking=False):
+            return
 
-    def _extract_data_text(self):
-        
-        label_dir = self._image_dir[:-6] + 'labels'
+def init_parallel_jobs(dbs, queue, fn, data_aug):
+    tasks = [Process(target=prefetch_data, args=(db, queue, fn, data_aug)) for db in dbs]
+    for task in tasks:
+        task.daemon = True
+        task.start()
+    return tasks
 
-        print('Start extract data')
+def train(training_dbs, validation_db, start_iter=0):
+    learning_rate    = system_configs.learning_rate
+    max_iteration    = system_configs.max_iter
+    pretrained_model = system_configs.pretrain
+    snapshot         = system_configs.snapshot
+    val_iter         = system_configs.val_iter
+    display          = system_configs.display
+    decay_rate       = system_configs.decay_rate
+    stepsize         = system_configs.stepsize
 
-        self._image_ids = []
-        for img_id in os.listdir(self._image_dir):
-            if os.path.exists(os.path.join(label_dir, os.path.splitext(os.path.basename(img_id))[0]+'.json')):
-                self._image_ids.append(img_id)
+    # getting the size of each database
+    training_size   = len(training_dbs[0].db_inds)
+    validation_size = len(validation_db.db_inds)
 
-        self._detections = {}
+    # queues storing data for training
+    training_queue   = Queue(system_configs.prefetch_size)
+    validation_queue = Queue(5)
 
-        for img_id in self._image_ids:
-            label_path = os.path.join(label_dir, os.path.splitext(os.path.basename(img_id))[0]+'.json')
-            data = json.load(open(label_path, 'r', encoding='utf-8'))
-            regions = data['attributes']['_via_img_metadata']['regions']
+    # queues storing pinned data for training
+    pinned_training_queue   = queue.Queue(system_configs.prefetch_size)
+    pinned_validation_queue = queue.Queue(5)
 
-            bboxes     = []
-            categories = []
+    # load data sampling function
+    data_file   = "sample.{}".format(training_dbs[0].data)
+    sample_data = importlib.import_module(data_file).sample_data
 
-            for rg in regions:
-                region_attr = rg['region_attributes']
-                shape_attr = rg['shape_attributes']
+    # allocating resources for parallel reading
+    training_tasks   = init_parallel_jobs(training_dbs, training_queue, sample_data, True)
+    if val_iter:
+        validation_tasks = init_parallel_jobs([validation_db], validation_queue, sample_data, False)
 
-                try:
-                    if shape_attr['name'] == 'polygon':
-                            x1, y1, x2, y2 = min(shape_attr['all_points_x']), min(shape_attr['all_points_y']), max(
-                                shape_attr['all_points_x']), max(shape_attr['all_points_y'])
-                            x, y, w, h = x1, y1, x2 - x1, y2 - y1     
-                    else:
-                        x, y, w, h = shape_attr['x'], shape_attr['y'], shape_attr['width'], shape_attr['height']
-                    bbox = [x, y, x+w, y+h]
-                    bboxes.append(bbox)
-                    if('stamp' in region_attr['formal_key']):
-                        categories.append(2)
-                    else:
-                        categories.append(1)
-                except KeyError as e:
-                    print(e)
-                    continue
-            bboxes     = np.array(bboxes, dtype=float)
-            categories = np.array(categories, dtype=float)
+    training_pin_semaphore   = threading.Semaphore()
+    validation_pin_semaphore = threading.Semaphore()
+    training_pin_semaphore.acquire()
+    validation_pin_semaphore.acquire()
+
+    training_pin_args   = (training_queue, pinned_training_queue, training_pin_semaphore)
+    training_pin_thread = threading.Thread(target=pin_memory, args=training_pin_args)
+    training_pin_thread.daemon = True
+    training_pin_thread.start()
+
+    validation_pin_args   = (validation_queue, pinned_validation_queue, validation_pin_semaphore)
+    validation_pin_thread = threading.Thread(target=pin_memory, args=validation_pin_args)
+    validation_pin_thread.daemon = True
+    validation_pin_thread.start()
+
+    print("building model...")
+    nnet = NetworkFactory(training_dbs[0])
+
+    if pretrained_model is not None:
+        if not os.path.exists(pretrained_model):
+            raise ValueError("pretrained model does not exist")
+        print("loading from pretrained model")
+        nnet.load_pretrained_params(pretrained_model)
+
+    if start_iter:
+        learning_rate /= (decay_rate ** (start_iter // stepsize))
+
+        nnet.load_params(start_iter)
+        nnet.set_lr(learning_rate)
+        print("training starts from iteration {} with learning_rate {}".format(start_iter + 1, learning_rate))
+    else:
+        nnet.set_lr(learning_rate)
+
+    print("training start...")
+    nnet.cuda()
+    nnet.train_mode()
+    with stdout_to_tqdm() as save_stdout:
+        for iteration in tqdm(range(start_iter + 1, max_iteration + 1), file=save_stdout, ncols=2):
+            training = pinned_training_queue.get(block=True)
+            training_loss, focal_loss, pull_loss, push_loss, regr_loss = nnet.train(**training)
+            #training_loss, focal_loss, pull_loss, push_loss, regr_loss, cls_loss = nnet.train(**training)
+
+            if display and iteration % display == 0:
+                print("training loss at iteration {}: {}".format(iteration, training_loss.item()))
+                print("focal loss at iteration {}:    {}".format(iteration, focal_loss.item()))
+                print("pull loss at iteration {}:     {}".format(iteration, pull_loss.item())) 
+                print("push loss at iteration {}:     {}".format(iteration, push_loss.item()))
+                print("regr loss at iteration {}:     {}".format(iteration, regr_loss.item()))
+                logger.info("training loss at iteration {}: {}".format(iteration, training_loss.item()))
+                logger.info("focal loss at iteration {}:    {}".format(iteration, focal_loss.item()))
+                logger.info("pull loss at iteration {}:     {}".format(iteration, pull_loss.item())) 
+                logger.info("push loss at iteration {}:     {}".format(iteration, push_loss.item()))
+                logger.info("regr loss at iteration {}:     {}".format(iteration, regr_loss.item()))
+                #print("cls loss at iteration {}:      {}\n".format(iteration, cls_loss.item()))
+
+            del training_loss, focal_loss, pull_loss, push_loss, regr_loss#, cls_loss
+
+            if val_iter and validation_db.db_inds.size and iteration % val_iter == 0:
+                nnet.eval_mode()
+                validation = pinned_validation_queue.get(block=True)
+                validation_loss = nnet.validate(**validation)
+                print("validation loss at iteration {}: {}".format(iteration, validation_loss.item()))
+                logger.info("validation loss at iteration {}: {}".format(iteration, validation_loss.item()))
+                nnet.train_mode()
+
+            if iteration % snapshot == 0:
+                nnet.save_params(iteration)
+
+            if iteration % stepsize == 0:
+                learning_rate /= decay_rate
+                nnet.set_lr(learning_rate)
+
+    # sending signal to kill the thread
+    training_pin_semaphore.release()
+    validation_pin_semaphore.release()
+
+    # terminating data fetching processes
+    for training_task in training_tasks:
+        training_task.terminate()
+    for validation_task in validation_tasks:
+        validation_task.terminate()
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    cfg_file = os.path.join(system_configs.config_dir, args.cfg_file + ".json")
+    with open(cfg_file, "r") as f:
+        configs = json.load(f)
             
-            self._detections[img_id] = np.hstack((bboxes, categories[:, None]))
+    configs["system"]["snapshot_name"] = args.cfg_file
+    system_configs.update_config(configs["system"])
 
-    def _extract_data(self):
-        print('Start extract data')
-        self._coco    = COCO(self._label_file)
-        self._cat_ids = self._coco.getCatIds()
+    train_split = system_configs.train_split
+    val_split   = system_configs.val_split
 
-        coco_image_ids = self._coco.getImgIds()
+    print("loading all datasets...")
+    dataset = system_configs.dataset
+    # threads = max(torch.cuda.device_count() * 2, 4)
+    threads = args.threads
+    print("using {} threads".format(threads))
+    training_dbs  = [datasets[dataset](configs["db"], train_split) for _ in range(threads)]
+    validation_db = datasets[dataset](configs["db"], val_split)
 
-        self._image_ids = [
-            self._coco.loadImgs(img_id)[0]["file_name"] 
-            for img_id in coco_image_ids
-        ]
-        self._detections = {}
-        for ind, (coco_image_id, image_id) in enumerate(tqdm(zip(coco_image_ids, self._image_ids))):
-            image      = self._coco.loadImgs(coco_image_id)[0]
-            bboxes     = []
-            categories = []
+    print("system config...")
+    pprint.pprint(system_configs.full)
 
-            for cat_id in self._cat_ids:
-                annotation_ids = self._coco.getAnnIds(imgIds=image["id"], catIds=cat_id)
-                
-                annotations    = self._coco.loadAnns(annotation_ids)
-                #print(annotations)
-                category       = self._coco_to_class_map[cat_id]
-                for annotation in annotations:
-                    bbox = np.array(annotation["bbox"])
-                    bbox[[2, 3]] += bbox[[0, 1]]
-                    bboxes.append(bbox)
-                    
-                    categories.append(category)
+    print("db config...")
+    pprint.pprint(training_dbs[0].configs)
 
-            bboxes     = np.array(bboxes, dtype=float)
-            categories = np.array(categories, dtype=float)
-            print(bboxes)
-            print(categories)
-            if bboxes.size == 0 or categories.size == 0:
-                self._detections[image_id] = np.zeros((0, 5), dtype=np.float32)
-            else:
-                self._detections[image_id] = np.hstack((bboxes, categories[:, None]))
-
-    def detections(self, ind):
-        image_id = self._image_ids[ind]
-        detections = self._detections[image_id]
-
-        return detections.astype(float).copy()
-
-    def _to_float(self, x):
-        return float("{:.2f}".format(x))
-
-    def convert_to_coco(self, all_bboxes):
-        detections = []
-        for image_id in all_bboxes:
-            coco_id = self._coco_eval_ids[image_id]
-            for cls_ind in all_bboxes[image_id]:
-                category_id = self._classes[cls_ind]
-                for bbox in all_bboxes[image_id][cls_ind]:
-                    bbox[2] -= bbox[0]
-                    bbox[3] -= bbox[1]
-
-                    score = bbox[4]
-                    bbox  = list(map(self._to_float, bbox[0:4]))
-
-                    detection = {
-                        "image_id": coco_id,
-                        "category_id": category_id,
-                        "bbox": bbox,
-                        "score": float("{:.2f}".format(score))
-                    }
-
-                    detections.append(detection)
-        return detections
-
-    def evaluate(self, result_json, cls_ids, image_ids, gt_json=None):
-        if self._split == "testdev":
-            return None
-
-        coco = self._coco if gt_json is None else COCO(gt_json)
-
-        eval_ids = [self._coco_eval_ids[image_id] for image_id in image_ids]
-        cat_ids  = [self._classes[cls_id] for cls_id in cls_ids]
-
-        coco_dets = coco.loadRes(result_json)
-        coco_eval = COCOeval(coco, coco_dets, "bbox")
-        coco_eval.params.imgIds = eval_ids
-        coco_eval.params.catIds = cat_ids
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-        coco_eval.evaluate_fd()
-        coco_eval.accumulate_fd()
-        coco_eval.summarize_fd()
-        return coco_eval.stats[0], coco_eval.stats[12:]
+    print("len of db: {}".format(len(training_dbs[0].db_inds)))
+    train(training_dbs, validation_db, args.start_iter)
